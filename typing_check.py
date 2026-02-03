@@ -2,8 +2,15 @@
 import sys
 import ast
 from pathlib import Path
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Set
 
+# --- CONFIGURATION ---
+# Dossiers à ignorer absolument lors du scan
+IGNORE_DIRS = {
+    ".git", ".idea", ".vscode", "__pycache__", ".mypy_cache", 
+    "venv", "env", "node_modules", ".pytest_cache"
+}
+# ---------------------
 
 class Style:
     def __init__(self, enabled: bool = True) -> None:
@@ -99,19 +106,29 @@ class TypeChecker:
         return len(issues) == 0, issues
 
 
-def list_py_files(ex_dir: Path) -> List[Path]:
+def get_recursive_py_files(directory: Path) -> List[Path]:
+    """Récupère récursivement tous les .py, sauf dans les dossiers ignorés."""
     files: List[Path] = []
-    for p in ex_dir.rglob("*.py"):
-        if "__pycache__" in p.parts:
+    if not directory.exists():
+        return files
+    
+    # rglob parcourt tout, mais on doit filtrer les dossiers ignorés
+    for p in directory.rglob("*.py"):
+        # Vérifie si un dossier parent est dans la liste noire
+        parts = p.parts
+        if any(bad in parts for bad in IGNORE_DIRS):
+            continue
+        if "__pycache__" in parts:
             continue
         files.append(p)
     return sorted(files)
 
 
-def parse_args(argv: List[str]) -> Tuple[bool, bool, List[int]]:
+def parse_args(argv: List[str]) -> Tuple[bool, bool, List[str], bool]:
     verbose = False
     color = True
-    exos: List[int] = []
+    targets: List[str] = []
+    manual_selection = False
 
     i = 1
     while i < len(argv):
@@ -123,21 +140,17 @@ def parse_args(argv: List[str]) -> Tuple[bool, bool, List[int]]:
         elif a in ("-h", "--help"):
             print(
                 "Usage:\n"
-                "  python3 typing_check.py [--verbose] [--no-color] [--ex 0 1 2]\n\n"
+                "  python3 typing_check.py [--verbose] [--target P00 P01 ...]\n\n"
                 "Examples:\n"
-                "  python3 typing_check.py          # Detects ex* folders automatically\n"
-                "  python3 typing_check.py --verbose\n"
-                "  python3 typing_check.py --ex 0 2 # Only check ex0 and ex2\n"
+                "  python3 typing_check.py          # Checks EVERYTHING from current dir\n"
+                "  python3 typing_check.py --target P05  # Checks only P05 folder\n"
             )
             sys.exit(0)
-        elif a == "--ex":
+        elif a in ("--target", "--ex"): # Support old flag --ex or new --target
+            manual_selection = True
             j = i + 1
             while j < len(argv) and not argv[j].startswith("-"):
-                try:
-                    exos.append(int(argv[j]))
-                except ValueError:
-                    print(f"Invalid ex number: {argv[j]}")
-                    sys.exit(2)
+                targets.append(argv[j])
                 j += 1
             i = j - 1
         else:
@@ -145,7 +158,7 @@ def parse_args(argv: List[str]) -> Tuple[bool, bool, List[int]]:
             sys.exit(2)
         i += 1
 
-    return verbose, color, exos
+    return verbose, color, targets, manual_selection
 
 
 def pad_right(s: str, width: int) -> str:
@@ -153,93 +166,132 @@ def pad_right(s: str, width: int) -> str:
 
 
 def main() -> None:
-    verbose, color, exos = parse_args(sys.argv)
+    verbose, color, targets, manual_selection = parse_args(sys.argv)
     st = Style(enabled=color)
     root = Path(".")
-
-    # --- ADAPTIVE LOGIC START ---
-    # If no specific exercises requested via --ex, scan the directory
-    if not exos:
-        detected_exs = []
-        for item in root.iterdir():
-            if item.is_dir() and item.name.startswith("ex") and item.name[2:].isdigit():
-                detected_exs.append(int(item.name[2:]))
-        exos = sorted(detected_exs)
-    # --- ADAPTIVE LOGIC END ---
+    
+    # On identifie le fichier actuel pour ne pas le scanner s'il est dans l'arborescence
+    myself = Path(__file__).resolve()
 
     checker = TypeChecker(min_return_coverage=100.0)
 
-    title = f"{st.bold}{st.blue}TYPE CHECKER{st.reset}{st.dim} (AST hints){st.reset}"
+    title = f"{st.bold}{st.blue}TYPE CHECKER{st.reset}{st.dim} (Recursive Scan){st.reset}"
     print(title)
     print(st.dim + "-" * 58 + st.reset)
 
-    if not exos:
-        print(f"{st.yellow}! No 'exX' directories found in current path.{st.reset}")
-        print(st.dim + "-" * 58 + st.reset)
+    # --- DISCOVERY ---
+    # Liste de tuples : (Nom_Affichage, Liste_Fichiers, Cle_Stats)
+    tasks = []
+
+    # 1. Fichiers à la racine (seulement si pas de sélection manuelle)
+    if not manual_selection:
+        root_files = []
+        for p in root.glob("*.py"):
+            if p.resolve() == myself:
+                continue
+            root_files.append(p)
+        if root_files:
+            root_files.sort()
+            tasks.append(("Root Files", root_files, "root"))
+
+    # 2. Dossiers cibles
+    dirs_to_scan = []
+
+    if manual_selection:
+        # L'utilisateur a donné des noms explicites (ex: P05, ex02, dossier_test)
+        for t in targets:
+            dirs_to_scan.append(root / t)
+    else:
+        # Scan automatique des sous-dossiers directs
+        for item in root.iterdir():
+            if item.is_dir():
+                if item.name.startswith("."): continue # Ignorer .git, .vscode...
+                if item.name in IGNORE_DIRS: continue
+                
+                # Si le script est dans un dossier 'tester', on l'ignore généralement
+                # pour ne pas qu'il se scanne lui-même, sauf demande explicite.
+                if myself.parent.name == item.name and myself.parent == item.resolve():
+                     continue
+
+                dirs_to_scan.append(item)
+        dirs_to_scan.sort(key=lambda x: x.name)
+
+    # Préparation des tâches
+    for d in dirs_to_scan:
+        files = get_recursive_py_files(d)
+        if files: # On n'ajoute la tâche que s'il y a des fichiers Python dedans
+            tasks.append((d.name, files, d.name))
+        elif manual_selection:
+             # Si c'était demandé explicitement mais vide, on l'ajoute quand même pour dire "EMPTY"
+             tasks.append((d.name, [], d.name))
+
+    if not tasks:
+        print(f"{st.yellow}! No Python files found in scan.{st.reset}")
         sys.exit(0)
 
+    # --- EXECUTION ---
     total_files = 0
     total_bad = 0
     total_ok = 0
+    stats = {}
 
-    per_ex_stats: Dict[int, Dict[str, int]] = {}
-    errors_by_file: List[Tuple[Path, List[str]]] = []
+    for label, files, key in tasks:
+        stats[key] = {"files": 0, "ok": 0, "bad": 0}
+        
+        print(f"{st.bold}{label}{st.reset}  {st.dim}({len(files)} file(s)){st.reset}")
 
-    for n in exos:
-        ex_dir = root / f"ex{n}"
-        per_ex_stats[n] = {"files": 0, "ok": 0, "bad": 0}
-
-        header = f"{st.bold}ex{n}{st.reset}"
-        # Since we auto-detected, the dir should exist, but good to double check
-        if not ex_dir.exists() or not ex_dir.is_dir():
-            print(f"{header}  {st.red}✗ missing directory{st.reset}")
-            total_bad += 1
+        if not files:
+            print(f"  {st.yellow}! no .py files found{st.reset}")
             continue
 
-        py_files = list_py_files(ex_dir)
-        if not py_files:
-            print(f"{header}  {st.yellow}! no .py files found{st.reset}")
-            continue
-
-        print(f"{header}  {st.dim}{len(py_files)} file(s){st.reset}")
-
-        for f in py_files:
+        for f in files:
             total_files += 1
-            per_ex_stats[n]["files"] += 1
+            stats[key]["files"] += 1
 
             ok, issues = checker.check_file(f)
 
+            # Chemin relatif pour l'affichage (ex: P05/ex00/main.py)
+            display_path = f
+            try:
+                display_path = f.relative_to(root)
+            except ValueError:
+                pass
+
             if ok:
                 total_ok += 1
-                per_ex_stats[n]["ok"] += 1
+                stats[key]["ok"] += 1
                 if verbose:
-                    print(f"  {st.green}✓{st.reset} {f}")
+                    print(f"  {st.green}✓{st.reset} {display_path}")
             else:
                 total_bad += 1
-                per_ex_stats[n]["bad"] += 1
-                errors_by_file.append((f, issues))
+                stats[key]["bad"] += 1
                 if verbose:
-                    print(f"  {st.red}✗{st.reset} {f}")
+                    print(f"  {st.red}✗{st.reset} {display_path}")
                     for it in issues:
                         print(f"     {st.red}-{st.reset} {it}")
                 else:
-                    print(f"  {st.red}✗{st.reset} {f}  {st.dim}({len(issues)} issue(s)){st.reset}")
+                    # Affichage concis en mode non-verbose
+                    print(f"  {st.red}✗{st.reset} {display_path}  {st.dim}({len(issues)}){st.reset}")
 
     print(st.dim + "-" * 58 + st.reset)
 
-    # Summary per ex
-    max_label = max((len(f"ex{n}") for n in per_ex_stats), default=3)
+    # --- SUMMARY ---
     print(st.bold + "Summary" + st.reset)
-    for n in exos:
-        s = per_ex_stats.get(n, {"files": 0, "ok": 0, "bad": 0})
-        label = pad_right(f"ex{n}", max_label)
+    
+    max_label = max((len(t[0]) for t in tasks), default=5)
+
+    for label, _, key in tasks:
+        s = stats[key]
+        lbl_pad = pad_right(label, max_label)
+        
         if s["bad"] == 0 and s["files"] > 0:
             status = f"{st.green}OK{st.reset}"
         elif s["files"] == 0:
             status = f"{st.yellow}EMPTY{st.reset}"
         else:
             status = f"{st.red}FAIL{st.reset}"
-        print(f"  {label}  {status}  {st.dim}{s['ok']}/{s['files']} passed{st.reset}")
+            
+        print(f"  {lbl_pad}  {status}  {st.dim}{s['ok']}/{s['files']} passed{st.reset}")
 
     print(st.dim + "-" * 58 + st.reset)
 
@@ -248,9 +300,8 @@ def main() -> None:
         sys.exit(0)
 
     print(f"{st.red}{st.bold}✗ FAILED{st.reset}  {st.dim}({total_bad}/{total_files} files){st.reset}")
-
     if not verbose:
-        print(st.dim + "Tip: run with --verbose to see exact issues per file." + st.reset)
+        print(st.dim + "Tip: run with --verbose to see exact issues." + st.reset)
 
     sys.exit(1)
 
