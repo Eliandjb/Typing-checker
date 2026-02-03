@@ -123,11 +123,11 @@ def parse_args(argv: List[str]) -> Tuple[bool, bool, List[int]]:
         elif a in ("-h", "--help"):
             print(
                 "Usage:\n"
-                "  python3 typing_check.py [--verbose] [--no-color] [--ex 0 1 2 3 4]\n\n"
+                "  python3 typing_check.py [--verbose] [--no-color] [--ex 0 1 2]\n\n"
                 "Examples:\n"
-                "  python3 typing_check.py\n"
+                "  python3 typing_check.py          # Detects ex* folders automatically\n"
                 "  python3 typing_check.py --verbose\n"
-                "  python3 typing_check.py --ex 0 1 2\n"
+                "  python3 typing_check.py --ex 0 2 # Only check ex0 and ex2\n"
             )
             sys.exit(0)
         elif a == "--ex":
@@ -145,9 +145,6 @@ def parse_args(argv: List[str]) -> Tuple[bool, bool, List[int]]:
             sys.exit(2)
         i += 1
 
-    if not exos:
-        exos = [0, 1, 2, 3, 4]
-
     return verbose, color, exos
 
 
@@ -158,13 +155,28 @@ def pad_right(s: str, width: int) -> str:
 def main() -> None:
     verbose, color, exos = parse_args(sys.argv)
     st = Style(enabled=color)
+    root = Path(".")
+
+    # --- ADAPTIVE LOGIC START ---
+    # If no specific exercises requested via --ex, scan the directory
+    if not exos:
+        detected_exs = []
+        for item in root.iterdir():
+            if item.is_dir() and item.name.startswith("ex") and item.name[2:].isdigit():
+                detected_exs.append(int(item.name[2:]))
+        exos = sorted(detected_exs)
+    # --- ADAPTIVE LOGIC END ---
 
     checker = TypeChecker(min_return_coverage=100.0)
-    root = Path(".")
 
     title = f"{st.bold}{st.blue}TYPE CHECKER{st.reset}{st.dim} (AST hints){st.reset}"
     print(title)
     print(st.dim + "-" * 58 + st.reset)
+
+    if not exos:
+        print(f"{st.yellow}! No 'exX' directories found in current path.{st.reset}")
+        print(st.dim + "-" * 58 + st.reset)
+        sys.exit(0)
 
     total_files = 0
     total_bad = 0
@@ -178,6 +190,7 @@ def main() -> None:
         per_ex_stats[n] = {"files": 0, "ok": 0, "bad": 0}
 
         header = f"{st.bold}ex{n}{st.reset}"
+        # Since we auto-detected, the dir should exist, but good to double check
         if not ex_dir.exists() or not ex_dir.is_dir():
             print(f"{header}  {st.red}✗ missing directory{st.reset}")
             total_bad += 1
@@ -244,4 +257,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
