@@ -22,9 +22,9 @@ Usage
 From your project root:
 python3 tester/typing_check.py
 Target specific folders:
-python3 tester/typing_check.py --target P05 ex00
+python3 Typing-checker/typing_check.py --target P05 ex00
 Verbose output:
-python3 tester/typing_check.py --verbose
+python3 Typing-checker/typing_check.py --verbose
 Example output
 ⚡ PYTHON STATIC ANALYZER ⚡
 📂 P05
