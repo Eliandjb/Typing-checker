@@ -25,9 +25,6 @@ cd Typing-checker
 
 C'est une excellente idée. Un bon README est ce qui fait la différence entre un "petit script" et un "vrai projet" sur GitHub. Puisque ton outil est maintenant récursif et adaptatif, on va le mettre en valeur.
 
-Voici une proposition de README.md professionnel (en anglais, car c'est la norme sur GitHub, mais je peux te le traduire si tu préfères).
-
-Tu n'as qu'à copier-coller ce bloc dans ton fichier README.md.
 
 Markdown
 
