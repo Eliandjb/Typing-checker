@@ -3,184 +3,219 @@ import sys
 import ast
 import shutil
 from pathlib import Path
-from typing import List, Tuple, Dict, Set
+from typing import List, Tuple, Dict, Any
 
 # --- CONFIGURATION ---
+# J'ai ajouté 'site-packages', 'lib', 'bin', 'include' pour éviter de scanner ton venv
 IGNORE_DIRS = {
     ".git", ".idea", ".vscode", "__pycache__", ".mypy_cache", 
-    "venv", "env", "node_modules", ".pytest_cache"
+    "venv", "env", ".env", "node_modules", ".pytest_cache", "build", "dist",
+    "site-packages", "lib", "bin", "include", "Lib", "Scripts"
 }
 
+# --- STYLE MANAGER ---
 class Style:
     def __init__(self, enabled: bool = True) -> None:
         self.enabled = enabled and sys.stdout.isatty()
 
-    def _c(self, code: str) -> str:
-        return f"\033[{code}m" if self.enabled else ""
-
+    def _c(self, code: str) -> str: return f"\033[{code}m" if self.enabled else ""
+    
     @property
     def rst(self) -> str: return self._c("0")
     @property
-    def b(self) -> str: return self._c("1") # Bold
+    def b(self) -> str: return self._c("1")
     @property
-    def d(self) -> str: return self._c("2") # Dim
-    @property
-    def i(self) -> str: return self._c("3") # Italic
-    @property
-    def u(self) -> str: return self._c("4") # Underline
+    def d(self) -> str: return self._c("2")
     
-    # Foreground
     @property
-    def red(self) -> str: return self._c("31")
+    def red(self) -> str: return self._c("38;5;196")
     @property
-    def green(self) -> str: return self._c("32")
+    def green(self) -> str: return self._c("38;5;46")
     @property
-    def yellow(self) -> str: return self._c("33")
+    def yellow(self) -> str: return self._c("38;5;226")
     @property
-    def blue(self) -> str: return self._c("34")
+    def blue(self) -> str: return self._c("38;5;39")
     @property
-    def cyan(self) -> str: return self._c("36")
+    def gray(self) -> str: return self._c("38;5;240")
     @property
-    def white(self) -> str: return self._c("37")
+    def white(self) -> str: return self._c("38;5;15")
 
-    # Background (pour les badges)
     @property
-    def bg_green(self) -> str: return self._c("42")
+    def bg_green(self) -> str: return self._c("48;5;46")
     @property
-    def bg_red(self) -> str: return self._c("41")
+    def bg_red(self) -> str: return self._c("48;5;196")
     @property
-    def bg_yellow(self) -> str: return self._c("43")
+    def bg_yellow(self) -> str: return self._c("48;5;226")
 
-def draw_progress_bar(percent: float, width: int = 10, st: Style = None) -> str:
-    """Dessine une barre de progression [████░░]"""
+st = Style()
+
+# --- UTILS ---
+def draw_bar(percent: float, width: int = 12) -> str:
     if percent < 0: percent = 0
     if percent > 100: percent = 100
-    
     filled = int(width * percent / 100)
-    empty = width - filled
-    
-    # Couleur de la barre selon le score
-    c = st.green if percent == 100 else (st.yellow if percent > 50 else st.red)
-    
-    bar = c + "█" * filled + st.d + "░" * empty + st.rst
-    return f"{st.d}[{st.rst}{bar}{st.d}]{st.rst}"
+    color = st.green if percent == 100 else (st.yellow if percent >= 70 else st.red)
+    return f"{st.d}[{st.rst}{color}{'━' * filled}{st.d}{'─' * (width - filled)}{st.d}]{st.rst}"
 
+def get_grade(score: float) -> str:
+    if score == 100: return f"{st.b}{st.green} S {st.rst}"
+    if score >= 90: return f"{st.b}{st.blue} A {st.rst}"
+    if score >= 75: return f"{st.b}{st.yellow} B {st.rst}"
+    if score >= 50: return f"{st.b}{st.red} C {st.rst}"
+    return f"{st.b}{st.gray} F {st.rst}"
+
+# --- CORE LOGIC ---
 class TypeChecker:
-    def __init__(self, min_return_coverage: float = 100.0) -> None:
-        self.min_return_coverage = min_return_coverage
+    def __init__(self) -> None:
+        self.min_return_coverage = 100.0
+
+    def _get_annotation_name(self, node: Any) -> str:
+        if node is None: return ""
+        if sys.version_info >= (3, 9):
+            try: return ast.unparse(node)
+            except: pass
+        if isinstance(node, ast.Name): return node.id
+        if isinstance(node, ast.Constant): return str(node.value)
+        if isinstance(node, ast.Subscript):
+             val = self._get_annotation_name(node.value)
+             return f"{val}[...]"
+        return "complex_type"
+
+    def _check_optional_consistency(self, fn: ast.FunctionDef, issues: List[str]) -> None:
+        defaults = fn.args.defaults
+        
+        # FIX: Combine posonlyargs (Python 3.8+) and regular args
+        # This prevents IndexError when analyzing libraries like setuptools
+        pos_args = getattr(fn.args, 'posonlyargs', []) + fn.args.args
+        
+        if not defaults: return
+        
+        offset = len(pos_args) - len(defaults)
+        
+        for i, default_val in enumerate(defaults):
+            # Safety check to avoid crash if AST is weird
+            idx = offset + i
+            if idx < 0 or idx >= len(pos_args):
+                continue
+
+            arg_node = pos_args[idx]
+            if isinstance(default_val, ast.Constant) and default_val.value is None:
+                if arg_node.annotation:
+                    anno = self._get_annotation_name(arg_node.annotation)
+                    if "Optional" not in anno and "None" not in anno and "|" not in anno:
+                        issues.append(f"{st.yellow}L:{arg_node.lineno:<3}{st.rst} Arg '{st.b}{arg_node.arg}{st.rst}' defaults to None but type is '{anno}'. Use Optional[{anno}].")
+
+    def _check_raw_collections(self, fn: ast.FunctionDef, issues: List[str]) -> None:
+        # Check both posonlyargs and args
+        all_args = getattr(fn.args, 'posonlyargs', []) + fn.args.args
+        for arg in all_args:
+            if not arg.annotation: continue
+            if isinstance(arg.annotation, ast.Name):
+                t_name = arg.annotation.id
+                if t_name in ("List", "Dict", "Set", "Tuple"):
+                    issues.append(f"{st.yellow}L:{arg.lineno:<3}{st.rst} Arg '{st.b}{arg.arg}{st.rst}' uses raw '{t_name}'. Prefer '{t_name}[type]'.")
 
     def _check_return_consistency(self, fn: ast.FunctionDef, issues: List[str]) -> None:
-        if not fn.returns or not isinstance(fn.returns, ast.Name):
-            return
-
-        expected_type = fn.returns.id
-        if expected_type not in ('int', 'str', 'bool', 'float'):
-            return
+        if not fn.returns or not isinstance(fn.returns, ast.Name): return
+        expected = fn.returns.id
+        if expected not in ('int', 'str', 'bool', 'float'): return
 
         for node in ast.walk(fn):
             if isinstance(node, ast.Return) and node.value is not None:
                 if isinstance(node.value, ast.Constant):
                     val = node.value.value
-                    actual_type = type(val).__name__
-                    if actual_type != expected_type:
-                        issues.append(
-                            f"{fn.name}: return type mismatch (returns '{actual_type}' but expecting '{expected_type}')"
-                        )
+                    actual = type(val).__name__
+                    if actual != expected and not (expected == 'float' and actual == 'int'):
+                         issues.append(f"{st.red}L:{node.lineno:<3}{st.rst} Function expects '{expected}' but returns '{actual}'.")
 
-    def _check_function(self, fn: ast.FunctionDef, issues: List[str]) -> None:
-        for arg in fn.args.args:
-            if arg.arg in ("self", "cls"):
-                continue
-            if arg.annotation is None:
-                issues.append(f"{fn.name}: param '{arg.arg}' missing annotation")
-
-        if fn.args.vararg is not None and fn.args.vararg.annotation is None:
-            issues.append(f"{fn.name}: vararg '*{fn.args.vararg.arg}' missing annotation")
-
-        if fn.args.kwarg is not None and fn.args.kwarg.annotation is None:
-            issues.append(f"{fn.name}: kwarg '**{fn.args.kwarg.arg}' missing annotation")
-
-        if fn.returns is None and fn.name != "__init__":
-            issues.append(f"{fn.name}: missing return annotation")
-        
-        self._check_return_consistency(fn, issues)
-
-    def check_file(self, file_path: Path) -> Tuple[bool, List[str]]:
+    def check_file(self, file_path: Path) -> Tuple[bool, List[str], float]:
         try:
             content = file_path.read_text(encoding="utf-8")
             tree = ast.parse(content)
         except Exception as e:
-            return False, [f"parse error: {e}"]
+            return False, [f"{st.red}Parse Error{st.rst}: {str(e)}"], 0.0
 
         functions = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]
-        if not functions:
-            return True, []
+        
+        if not functions: return True, [], 100.0
 
         issues: List[str] = []
         fn_total = 0
-        fn_ok_return = 0
+        fn_ok = 0
 
         for fn in functions:
+            fn_issues = []
+            
+            # Check positional-only args AND regular args
+            all_args = getattr(fn.args, 'posonlyargs', []) + fn.args.args
+            
+            for arg in all_args:
+                if arg.arg in ("self", "cls"): continue
+                if arg.annotation is None:
+                    fn_issues.append(f"{st.red}L:{arg.lineno:<3}{st.rst} Missing annotation for arg '{st.b}{arg.arg}{st.rst}'")
+
+            # Check keyword-only args
+            for arg in fn.args.kwonlyargs:
+                if arg.annotation is None:
+                    fn_issues.append(f"{st.red}L:{arg.lineno:<3}{st.rst} Missing annotation for kw-only arg '{st.b}{arg.arg}{st.rst}'")
+
+            if fn.returns is None and fn.name != "__init__":
+                fn_issues.append(f"{st.red}L:{fn.lineno:<3}{st.rst} Missing return annotation")
+
+            self._check_optional_consistency(fn, fn_issues)
+            self._check_raw_collections(fn, fn_issues)
+            self._check_return_consistency(fn, fn_issues)
+
+            if not fn_issues:
+                fn_ok += 1
+            else:
+                issues.append(f"{st.d}In function '{st.b}{fn.name}{st.rst}{st.d}':{st.rst}")
+                issues.extend([f"   {i}" for i in fn_issues])
+
             fn_total += 1
-            if fn.returns is not None or fn.name == "__init__":
-                fn_ok_return += 1
-            self._check_function(fn, issues)
 
-        if fn_total > 0:
-            coverage = (fn_ok_return / fn_total) * 100.0
-            if coverage < self.min_return_coverage:
-                issues.append(f"return coverage too low: {coverage:.1f}%")
+        score = (fn_ok / fn_total * 100) if fn_total > 0 else 100.0
+            
+        return len(issues) == 0, issues, score
 
-        return len(issues) == 0, issues
-
+# --- DISCOVERY ---
 def get_recursive_py_files(directory: Path) -> List[Path]:
     files: List[Path] = []
-    if not directory.exists():
-        return files
-    
+    if not directory.exists(): return files
     for p in directory.rglob("*.py"):
-        parts = p.parts
-        if any(bad in parts for bad in IGNORE_DIRS):
-            continue
+        # Improved Ignore Logic: Check if any part of the path matches IGNORE_DIRS
+        if any(bad in p.parts for bad in IGNORE_DIRS): continue
         files.append(p)
     return sorted(files)
 
-def parse_args(argv: List[str]) -> Tuple[bool, bool, List[str], bool]:
+def parse_args(argv: List[str]) -> Tuple[bool, List[str], bool]:
     verbose = False
-    color = True
-    targets: List[str] = []
-    manual_selection = False
+    targets = []
+    manual = False
     i = 1
     while i < len(argv):
         a = argv[i]
         if a in ("-v", "--verbose"): verbose = True
-        elif a == "--no-color": color = False
-        elif a in ("-h", "--help"):
-            print("Usage: python3 typing_check.py [--verbose] [--target DIR]")
-            sys.exit(0)
         elif a in ("--target", "--ex"):
-            manual_selection = True
+            manual = True
             j = i + 1
             while j < len(argv) and not argv[j].startswith("-"):
                 targets.append(argv[j])
                 j += 1
             i = j - 1
         i += 1
-    return verbose, color, targets, manual_selection
+    return verbose, targets, manual
 
+# --- MAIN ---
 def main() -> None:
-    verbose, color, targets, manual_selection = parse_args(sys.argv)
-    st = Style(enabled=color)
+    verbose, targets, manual_selection = parse_args(sys.argv)
     root = Path(".")
     myself = Path(__file__).resolve()
     
-    # Header
-    term_width = shutil.get_terminal_size((80, 20)).columns
-    print("\n" + f" {st.b}{st.white}TYPE CHECKER{st.rst} {st.blue}AST Analysis{st.rst} ".center(term_width + (len(st.b) if st.enabled else 0), "─"))
-    
-    checker = TypeChecker(min_return_coverage=100.0)
-    
-    # Discovery Logic
+    term_w = shutil.get_terminal_size((80, 20)).columns
+    print(f"\n{st.b}⚡ PYTHON STATIC ANALYZER ⚡{st.rst}".center(term_w + 10))
+    print(f"{st.d}{'─' * term_w}{st.rst}")
+
     tasks = []
     if not manual_selection:
         root_files = [p for p in root.glob("*.py") if p.resolve() != myself]
@@ -198,89 +233,86 @@ def main() -> None:
 
     for d in dirs_to_scan:
         files = get_recursive_py_files(d)
-        if files or manual_selection:
-            tasks.append((d.name, files, d.name))
+        if files or manual_selection: tasks.append((d.name, files, d.name))
 
     if not tasks:
-        print(f"\n  {st.yellow}⚠ No files to check.{st.rst}\n")
+        print(f"  {st.yellow}⚠  No Python files found.{st.rst}\n")
         sys.exit(0)
 
-    # Execution
-    total_files = 0
-    total_bad = 0
+    checker = TypeChecker()
     stats = {}
+    total_bad_files = 0
+    total_files = 0
 
     for label, files, key in tasks:
-        stats[key] = {"files": 0, "ok": 0, "bad": 0}
+        stats[key] = {"files": 0, "score_sum": 0.0, "clean": True}
         
-        # Section Header
-        print(f"\n{st.b}{st.cyan}● {label.upper()}{st.rst}")
-        
+        print(f"\n{st.blue}📂 {st.b}{label.upper()}{st.rst}")
+
         if not files:
             print(f"  {st.d}╰─ (empty){st.rst}")
             continue
 
         for i, f in enumerate(files):
             is_last = (i == len(files) - 1)
-            tree_char = "╰─" if is_last else "├─"
+            tree = "╰─" if is_last else "├─"
             
+            ok, issues, f_score = checker.check_file(f)
             total_files += 1
+            
             stats[key]["files"] += 1
-            ok, issues = checker.check_file(f)
+            stats[key]["score_sum"] += f_score
 
-            # Relatif path for display
-            try: display_path = f.relative_to(root)
-            except ValueError: display_path = f.name
-
+            try: rel_path = f.relative_to(root)
+            except: rel_path = f.name
+            
             if ok:
-                stats[key]["ok"] += 1
                 if verbose:
-                    print(f"  {st.d}{tree_char}{st.rst} {st.green}✔{st.rst} {st.d}{display_path}{st.rst}")
+                    print(f"  {st.d}{tree}{st.rst} {st.green}✔{st.rst} {rel_path}")
             else:
-                total_bad += 1
-                stats[key]["bad"] += 1
-                # If verbose, print detailed, else just a red line
-                if verbose:
-                    print(f"  {st.d}{tree_char}{st.rst} {st.red}✖ {display_path}{st.rst}")
-                    for issue in issues:
-                        prefix = "    " if is_last else "  │ "
-                        print(f"  {st.d}{prefix}  • {issue}{st.rst}")
-                else:
-                    print(f"  {st.d}{tree_char}{st.rst} {st.red}✖ {display_path}{st.rst} {st.red}{len(issues)} err{st.rst}")
+                stats[key]["clean"] = False
+                total_bad_files += 1
+                print(f"  {st.d}{tree}{st.rst} {st.red}✖{st.rst} {rel_path} {st.d}(Score: {int(f_score)}%){st.rst}")
+                
+                prefix = "    " if is_last else "  │ "
+                for issue in issues:
+                    print(f"  {st.d}{prefix}{st.rst} {issue}")
 
-    # Summary
-    print("\n" + " SUMMARY ".center(term_width, "─"))
+    # Summary Table
+    print("\n" + f"{st.b}📊 SUMMARY REPORT{st.rst}".center(term_w + 10))
+    print(f"{st.d}{'─' * term_w}{st.rst}")
     
-    max_label_len = max((len(t[0]) for t in tasks), default=10)
-    
+    col_w = max((len(t[0]) for t in tasks), default=10) + 2
+    print(f"  {st.d}{'MODULE':<{col_w}} {'STATUS':<10} {'PROGRESS':<14} {'GRADE':<5}{st.rst}")
+
     for label, _, key in tasks:
         s = stats[key]
-        n_files = s['files']
-        n_ok = s['ok']
+        n_files = s["files"]
+        avg_score = (s["score_sum"] / n_files) if n_files > 0 else 0.0
         
-        # Calculate percentage
-        pct = (n_ok / n_files * 100) if n_files > 0 else 0
-        
-        # Badge
         if n_files == 0:
-            badge = f"{st.d}[ EMPTY  ]{st.rst}"
-        elif s['bad'] == 0:
-            badge = f"{st.bg_green}{st.b}{st.white}  PASS  {st.rst}"
+            status = f"{st.d}EMPTY   {st.rst}"
+            bar = f"{st.d}[          ]{st.rst}"
+            grade = "-"
+        elif s["clean"] and avg_score == 100:
+            status = f"{st.green}PASS    {st.rst}"
+            bar = draw_bar(100)
+            grade = get_grade(100)
         else:
-            badge = f"{st.bg_red}{st.b}{st.white}  FAIL  {st.rst}"
-            
-        bar = draw_progress_bar(pct, width=12, st=st)
-        
-        print(f" {label:<{max_label_len}}  {badge}  {bar} {st.d}{n_ok}/{n_files}{st.rst}")
+            status = f"{st.red}FAIL    {st.rst}"
+            bar = draw_bar(avg_score)
+            grade = get_grade(avg_score)
+
+        print(f"  {st.b}{label:<{col_w}}{st.rst} {status} {bar}  {grade}")
 
     print("")
-    if total_bad == 0:
-        print(f"{st.green}✨  All {total_files} files look good! Nice job.{st.rst}\n")
+    if total_bad_files == 0:
+        print(f"{st.bg_green}{st.b}{st.white} ✨ PERFECT RUN! ALL SYSTEMS GO. ✨ {st.rst}\n")
         sys.exit(0)
     else:
-        print(f"{st.red}💥  Found issues in {total_bad} file(s).{st.rst}")
+        print(f"{st.b}{st.white}Total Issues:{st.rst} {st.red}{total_bad_files} files failed checks.{st.rst}")
         if not verbose:
-            print(f"{st.d}    Run with --verbose to see details.{st.rst}")
+            print(f"{st.d}Tip: Run with --verbose to see passing files.{st.rst}")
         print("")
         sys.exit(1)
 
