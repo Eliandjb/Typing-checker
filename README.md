@@ -4,9 +4,6 @@ A lightweight, **zero-dependency** static analysis tool designed to enforce Pyth
 
 It uses Python's built-in Abstract Syntax Tree (`ast`) to scan your code, ensuring that functions have proper argument and return type annotations.
 
-![License](https://img.shields.io/badge/license-MIT-blue.svg)
-![Python](https://img.shields.io/badge/python-3.6+-yellow.svg)
-![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen.svg)
 
 ## ✨ Features
 
